@@ -5,6 +5,13 @@ import numpy as np
 import joblib
 from google.cloud import storage
 import os
+import logging # Aggiunto per un logging più robusto
+import traceback # Aggiunto per catturare stack trace completi degli errori
+
+# Configura il logging. Questo indirizza i log a stderr, che Cloud Logging cattura.
+# Puoi impostare level=logging.DEBUG per un output ancora più dettagliato durante il debug.
+logging.basicConfig(level=logging.INFO)
+
 
 # --- 1. CONFIGURAZIONE (verifica che il bucket sia corretto!) ---
 # Sostituisci con il nome del tuo bucket Google Cloud Storage dove sono salvati i modelli
@@ -39,7 +46,7 @@ model_names = [
 # per riutilizzarlo.
 storage_client = storage.Client()
 
-print(f"Caricamento modelli dal bucket GCS: {GCS_BUCKET_NAME}...")
+logging.info(f"Caricamento modelli dal bucket GCS: {GCS_BUCKET_NAME}...") # Modificato per usare logging
 
 for name in model_names:
     model_filename = f'model_{name}.joblib'
@@ -51,10 +58,10 @@ for name in model_names:
         blob = bucket.blob(gcs_path)
         blob.download_to_filename(local_path)
         models[name] = joblib.load(local_path)
-        print(f"Modello {name} caricato con successo.")
+        logging.info(f"Modello {name} caricato con successo.") # Modificato per usare logging
     except Exception as e:
-        print(f"Errore durante il caricamento del modello {name} da GCS: {e}")
-        # Gestire l'errore: forse terminare o marcare il modello come non disponibile
+        logging.error(f"Errore durante il caricamento del modello {name} da GCS: {e}") # Modificato per usare logging.error
+        logging.error(traceback.format_exc()) # Aggiunto per stampare lo stack trace completo
         models[name] = None # Imposta a None per indicare che non è disponibile
 
 
@@ -99,19 +106,7 @@ def find_contiguous_blocks(probabilities, num_blocks=3, block_size=5):
         })
 
     # Ordina i blocchi per punteggio decrescente e prendi i migliori num_blocks
-    # Usiamo una chiave per l'ordinamento per garantire un ordinamento stabile in caso di punteggi uguali
-    # Se due blocchi hanno lo stesso punteggio, l'ordinamento naturale predefinito per il secondo elemento (l'indice originale)
-    # può essere usato per garantire la riproducibilità, ma non è strettamente necessario qui.
     sorted_blocks = sorted(block_scores, key=lambda x: x['score'], reverse=True)
-
-    # Prendi i primi 'num_blocks' blocchi, assicurandoti che non ci siano sovrapposizioni
-    # Questo è un requisito chiave per "blocchi contigui" distinti.
-    # Per semplicità, inizialmente prendiamo i top N senza gestione sovrapposizioni complesse
-    # se sono esattamente 3 blocchi di 5, potrebbero naturalmente non sovrapporsi se la selezione è casuale.
-    # Ma se la strategia è trovare "i migliori 3 blocchi di 5", potrebbero sovrapporsi.
-    # Qui li prendiamo come i 3 migliori per punteggio, indipendentemente dalla sovrapposizione.
-    # Se il requisito è "3 blocchi NON SOVRAPPOSTI", la logica dovrebbe essere più complessa.
-    # Per ora, restituiamo semplicemente i 3 migliori blocchi in base al punteggio.
 
     top_blocks = [block['numbers'] for block in sorted_blocks[:num_blocks]]
 
@@ -144,11 +139,13 @@ def predict_roulette(request):
     # Estrai 'last_5_numbers' dal payload JSON
     if request_json and 'last_5_numbers' in request_json:
         last_5_numbers = request_json['last_5_numbers']
-        print(f"Ricevuta richiesta con ultimi 5 numeri: {last_5_numbers}")
+        logging.info(f"Ricevuta richiesta con ultimi 5 numeri: {last_5_numbers}") # Modificato per usare logging
     else:
+        logging.error('Errore: Il campo "last_5_numbers" è richiesto nel payload JSON.') # Modificato per usare logging.error
         return ('Errore: Il campo "last_5_numbers" è richiesto nel payload JSON.', 400, headers)
 
     if not isinstance(last_5_numbers, list) or len(last_5_numbers) != 5:
+        logging.error('Errore: "last_5_numbers" deve essere una lista di 5 numeri.') # Modificato per usare logging.error
         return ('Errore: "last_5_numbers" deve essere una lista di 5 numeri.', 400, headers)
 
     # Converti la lista in un array NumPy con la forma corretta per i modelli (1 riga, 5 colonne)
@@ -159,6 +156,7 @@ def predict_roulette(request):
     for model_name, model in models.items():
         if model is None:
             all_predictions[model_name] = "Modello non disponibile"
+            logging.warning(f"Modello {model_name} non disponibile, saltato.") # Aggiunto warning
             continue
 
         try:
@@ -170,10 +168,11 @@ def predict_roulette(request):
             
             # L'output ora sarà una lista di blocchi
             all_predictions[model_name] = top_contiguous_blocks
-            print(f"Previsione {model_name} (blocchi contigui): {top_contiguous_blocks}")
+            logging.info(f"Previsione {model_name} (blocchi contigui): {top_contiguous_blocks}") # Modificato per usare logging
 
         except Exception as e:
             all_predictions[model_name] = f"Errore durante la previsione: {e}"
-            print(f"Errore durante la previsione con {model_name}: {e}")
+            logging.error(f"Errore durante la previsione con {model_name}: {e}") # Modificato per usare logging.error
+            logging.error(traceback.format_exc()) # Aggiunto per stampare lo stack trace completo
 
     return (all_predictions, 200, headers)
