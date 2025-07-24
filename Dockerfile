@@ -3,6 +3,7 @@
 FROM python:3.11-slim-bookworm
 
 # Installa la libreria di sistema mancante: libgomp1
+# Questo risolve l'errore "OSError: libgomp.so.1: cannot open shared object file: No such file or directory"
 # Esegui apt-get clean per pulire la cache dei pacchetti e ridurre le dimensioni dell'immagine finale.
 RUN apt-get update && apt-get install -y libgomp1 && rm -rf /var/lib/apt/lists/*
 
@@ -19,4 +20,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Il comando che verrà eseguito quando il container si avvia.
+# Specifica la funzione 'predict_roulette' da eseguire sulla porta 8080.
 CMD ["functions-framework", "--target", "predict_roulette", "--port", "8080"]
