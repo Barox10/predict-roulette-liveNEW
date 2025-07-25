@@ -5,11 +5,10 @@ import numpy as np
 import joblib
 from google.cloud import storage
 import os
-import logging # Aggiunto per un logging più robusto
-import traceback # Aggiunto per catturare stack trace completi degli errori
+import logging
+import traceback
 
 # Configura il logging. Questo indirizza i log a stderr, che Cloud Logging cattura.
-# Puoi impostare level=logging.DEBUG per un output ancora più dettagliato durante il debug.
 logging.basicConfig(level=logging.INFO)
 
 
@@ -30,6 +29,23 @@ ROULETTE_WHEEL_SEQUENCE = [
 ROULETTE_INDEX_MAP = {num: i for i, num in enumerate(ROULETTE_WHEEL_SEQUENCE)}
 
 
+# --- Funzione per la preparazione delle caratteristiche ---
+# Questa funzione converte una lista di numeri recenti (es. 5 numeri)
+# in un vettore di 37 caratteristiche (conteggio di ogni numero da 0 a 36).
+def _prepare_features(last_n_numbers):
+    """
+    Converte una lista di numeri in un vettore di caratteristiche per i modelli.
+    Il vettore avrà 37 elementi, dove ogni indice (0-36) rappresenta un numero
+    della roulette e il valore è la frequenza di quel numero nella lista di input.
+    """
+    features = np.zeros(37) # Inizializza un vettore di 37 zeri (per numeri da 0 a 36)
+    for num in last_n_numbers:
+        if 0 <= num <= 36: # Assicurati che il numero sia nel range valido della roulette
+            features[num] += 1
+    # Rimodella per la previsione di un singolo campione (1 riga, 37 colonne)
+    return features.reshape(1, -1)
+
+
 # --- 2. CARICAMENTO DEI MODELLI ---
 # Questa parte carica i modelli dal GCS al momento dell'inizializzazione della funzione
 # (cold start), evitando di caricarli ad ogni richiesta.
@@ -46,7 +62,7 @@ model_names = [
 # per riutilizzarlo.
 storage_client = storage.Client()
 
-logging.info(f"Caricamento modelli dal bucket GCS: {GCS_BUCKET_NAME}...") # Modificato per usare logging
+logging.info(f"Caricamento modelli dal bucket GCS: {GCS_BUCKET_NAME}...")
 
 for name in model_names:
     model_filename = f'model_{name}.joblib'
@@ -58,11 +74,11 @@ for name in model_names:
         blob = bucket.blob(gcs_path)
         blob.download_to_filename(local_path)
         models[name] = joblib.load(local_path)
-        logging.info(f"Modello {name} caricato con successo.") # Modificato per usare logging
+        logging.info(f"Modello {name} caricato con successo.")
     except Exception as e:
-        logging.error(f"Errore durante il caricamento del modello {name} da GCS: {e}") # Modificato per usare logging.error
-        logging.error(traceback.format_exc()) # Aggiunto per stampare lo stack trace completo
-        models[name] = None # Imposta a None per indicare che non è disponibile
+        logging.error(f"Errore durante il caricamento del modello {name} da GCS: {e}")
+        logging.error(traceback.format_exc())
+        models[name] = None
 
 
 # --- 3. NUOVA LOGICA: FUNZIONE PER TROVARE BLOCCHI CONTIGUI ---
@@ -139,24 +155,25 @@ def predict_roulette(request):
     # Estrai 'last_5_numbers' dal payload JSON
     if request_json and 'last_5_numbers' in request_json:
         last_5_numbers = request_json['last_5_numbers']
-        logging.info(f"Ricevuta richiesta con ultimi 5 numeri: {last_5_numbers}") # Modificato per usare logging
+        logging.info(f"Ricevuta richiesta con ultimi 5 numeri: {last_5_numbers}")
     else:
-        logging.error('Errore: Il campo "last_5_numbers" è richiesto nel payload JSON.') # Modificato per usare logging.error
+        logging.error('Errore: Il campo "last_5_numbers" è richiesto nel payload JSON.')
         return ('Errore: Il campo "last_5_numbers" è richiesto nel payload JSON.', 400, headers)
 
     if not isinstance(last_5_numbers, list) or len(last_5_numbers) != 5:
-        logging.error('Errore: "last_5_numbers" deve essere una lista di 5 numeri.') # Modificato per usare logging.error
+        logging.error('Errore: "last_5_numbers" deve essere una lista di 5 numeri.')
         return ('Errore: "last_5_numbers" deve essere una lista di 5 numeri.', 400, headers)
 
-    # Converti la lista in un array NumPy con la forma corretta per i modelli (1 riga, 5 colonne)
-    input_features = np.array(last_5_numbers).reshape(1, -1)
+    # Converti la lista di 5 numeri in un array NumPy con 37 caratteristiche
+    # Questa è la modifica chiave per risolvere l'errore delle features
+    input_features = _prepare_features(last_5_numbers)
 
     all_predictions = {}
 
     for model_name, model in models.items():
         if model is None:
             all_predictions[model_name] = "Modello non disponibile"
-            logging.warning(f"Modello {model_name} non disponibile, saltato.") # Aggiunto warning
+            logging.warning(f"Modello {model_name} non disponibile, saltato.")
             continue
 
         try:
@@ -168,11 +185,11 @@ def predict_roulette(request):
             
             # L'output ora sarà una lista di blocchi
             all_predictions[model_name] = top_contiguous_blocks
-            logging.info(f"Previsione {model_name} (blocchi contigui): {top_contiguous_blocks}") # Modificato per usare logging
+            logging.info(f"Previsione {model_name} (blocchi contigui): {top_contiguous_blocks}")
 
         except Exception as e:
             all_predictions[model_name] = f"Errore durante la previsione: {e}"
-            logging.error(f"Errore durante la previsione con {model_name}: {e}") # Modificato per usare logging.error
-            logging.error(traceback.format_exc()) # Aggiunto per stampare lo stack trace completo
+            logging.error(f"Errore durante la previsione con {model_name}: {e}")
+            logging.error(traceback.format_exc())
 
     return (all_predictions, 200, headers)
