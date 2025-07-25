@@ -29,20 +29,26 @@ ROULETTE_WHEEL_SEQUENCE = [
 ROULETTE_INDEX_MAP = {num: i for i, num in enumerate(ROULETTE_WHEEL_SEQUENCE)}
 
 
-# --- Funzione per la preparazione delle caratteristiche ---
+# --- Funzione per la preparazione delle caratteristiche (AGGIORNATA) ---
 # Questa funzione converte una lista di numeri recenti (es. 5 numeri)
-# in un vettore di 37 caratteristiche (conteggio di ogni numero da 0 a 36).
-def _prepare_features(last_n_numbers):
+# in un vettore di 37 * 5 = 185 caratteristiche, codificando la posizione di ogni numero.
+def _prepare_features(last_n_numbers, num_possible_outcomes=37, sequence_length=5):
     """
-    Converte una lista di numeri in un vettore di caratteristiche per i modelli.
-    Il vettore avrà 37 elementi, dove ogni indice (0-36) rappresenta un numero
-    della roulette e il valore è la frequenza di quel numero nella lista di input.
+    Converte una lista di numeri in un vettore di caratteristiche per i modelli,
+    includendo la posizione di ciascun numero nella sequenza.
+    Il vettore avrà `num_possible_outcomes * sequence_length` elementi.
     """
-    features = np.zeros(37) # Inizializza un vettore di 37 zeri (per numeri da 0 a 36)
-    for num in last_n_numbers:
-        if 0 <= num <= 36: # Assicurati che il numero sia nel range valido della roulette
-            features[num] += 1
-    # Rimodella per la previsione di un singolo campione (1 riga, 37 colonne)
+    # Inizializza un vettore di zeri con la nuova dimensione (37 * 5 = 185)
+    features = np.zeros(num_possible_outcomes * sequence_length) 
+    
+    for i, num in enumerate(last_n_numbers):
+        if 0 <= num < num_possible_outcomes: # Assicurati che il numero sia nel range valido (0-36)
+            # Calcola l'indice nel vettore complessivo:
+            # (posizione del numero nella sequenza * numero totale di possibili esiti) + il numero stesso
+            feature_index = (i * num_possible_outcomes) + num
+            features[feature_index] = 1 # Imposta a 1 per indicare la presenza del numero in quella posizione
+    
+    # Rimodella per la previsione di un singolo campione (1 riga, 185 colonne)
     return features.reshape(1, -1)
 
 
@@ -164,8 +170,7 @@ def predict_roulette(request):
         logging.error('Errore: "last_5_numbers" deve essere una lista di 5 numeri.')
         return ('Errore: "last_5_numbers" deve essere una lista di 5 numeri.', 400, headers)
 
-    # Converti la lista di 5 numeri in un array NumPy con 37 caratteristiche
-    # Questa è la modifica chiave per risolvere l'errore delle features
+    # Converti la lista di 5 numeri in un array NumPy con 185 caratteristiche (nuovo formato)
     input_features = _prepare_features(last_5_numbers)
 
     all_predictions = {}
