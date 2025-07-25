@@ -7,6 +7,7 @@ from google.cloud import storage
 import os
 import logging
 import traceback
+from collections import Counter # Aggiunto per il conteggio del consenso
 
 # Configura il logging. Questo indirizza i log a stderr, che Cloud Logging cattura.
 logging.basicConfig(level=logging.INFO)
@@ -17,38 +18,68 @@ logging.basicConfig(level=logging.INFO)
 GCS_BUCKET_NAME = 'roulette-models-2025' # <--- VERIFICA CHE SIA CORRETTO!
 
 # Numero di risultati top da considerare per ogni modello prima della post-elaborazione
-PRED_NUMERI = 15
+PRED_NUMERI = 5 # MODIFICATO: Numero massimo di numeri da restituire nel consenso finale (da 15 a 5)
 
 # Definizione della sequenza dei numeri sulla ruota della roulette (francese/europea)
-# Questo è FONDAMENTALE per trovare i blocchi contigui
 ROULETTE_WHEEL_SEQUENCE = [
     0, 32, 15, 19, 4, 21, 2, 25, 17, 34, 6, 27, 13, 36, 11, 30, 8, 23, 10,
     5, 24, 16, 33, 1, 20, 14, 31, 9, 22, 18, 29, 7, 28, 12, 35, 3, 26
 ]
-# Creiamo un mapping per trovare velocemente l'indice di un numero nella sequenza
+# Creiamo un mapping per trovare velocemente l'indice di un numero nella sequenza (non direttamente usato nelle nuove features)
 ROULETTE_INDEX_MAP = {num: i for i, num in enumerate(ROULETTE_WHEEL_SEQUENCE)}
 
 
-# --- Funzione per la preparazione delle caratteristiche (AGGIORNATA) ---
+# --- Funzione helper per ottenere tutti i blocchi a cui un numero appartiene ---
+def _get_block_ids_for_number(number, roulette_wheel_sequence, block_size=5):
+    """
+    Dato un numero, restituisce una lista degli ID di tutti i blocchi contigui di `block_size`
+    sulla ruota della roulette che contengono questo numero.
+    L'ID del blocco 'i' corrisponde al blocco che inizia a roulette_wheel_sequence[i].
+    """
+    block_ids = []
+    wheel_len = len(roulette_wheel_sequence)
+    
+    # Itera su tutte le possibili posizioni di inizio blocco sulla ruota
+    for block_id in range(wheel_len):
+        # Costruisci il blocco corrente (avvolgendo se necessario)
+        current_block = []
+        for i in range(block_size):
+            current_block.append(roulette_wheel_sequence[(block_id + i) % wheel_len])
+        
+        # Se il numero è in questo blocco, aggiungi il suo block_id
+        if number in current_block:
+            block_ids.append(block_id)
+    return block_ids
+
+# --- Funzione per la preparazione delle caratteristiche (AGGIORNATA per l'appartenenza ai blocchi) ---
 # Questa funzione converte una lista di numeri recenti (es. 5 numeri)
-# in un vettore di 37 * 5 = 185 caratteristiche, codificando la posizione di ogni numero.
-def _prepare_features(last_n_numbers, num_possible_outcomes=37, sequence_length=5):
+# in un vettore di 37 * 5 = 185 caratteristiche, codificando l'appartenenza ai blocchi per ogni posizione.
+def _prepare_features(last_n_numbers, num_possible_outcomes=37, sequence_length=5, roulette_wheel_sequence=None):
     """
     Converte una lista di numeri in un vettore di caratteristiche per i modelli,
-    includendo la posizione di ciascun numero nella sequenza.
-    Il vettore avrà `num_possible_outcomes * sequence_length` elementi.
+    codificando l'appartenenza ai blocchi per ciascun numero nella sequenza.
+    Il vettore avrà `num_possible_outcomes * sequence_length` elementi (37 * 5 = 185).
+    Ogni elemento `features[ (posizione * 37) + block_id ]` sarà 1 se il numero
+    alla `posizione` appartiene a `block_id`.
     """
-    # Inizializza un vettore di zeri con la nuova dimensione (37 * 5 = 185)
     features = np.zeros(num_possible_outcomes * sequence_length) 
     
+    if roulette_wheel_sequence is None:
+        # Questo controllo è cruciale se la funzione viene chiamata direttamente senza la sequenza della ruota
+        logging.error("roulette_wheel_sequence deve essere fornita a _prepare_features per le features basate sui blocchi.")
+        raise ValueError("roulette_wheel_sequence deve essere fornita a _prepare_features per le features basate sui blocchi.")
+
     for i, num in enumerate(last_n_numbers):
         if 0 <= num < num_possible_outcomes: # Assicurati che il numero sia nel range valido (0-36)
-            # Calcola l'indice nel vettore complessivo:
-            # (posizione del numero nella sequenza * numero totale di possibili esiti) + il numero stesso
-            feature_index = (i * num_possible_outcomes) + num
-            features[feature_index] = 1 # Imposta a 1 per indicare la presenza del numero in quella posizione
+            # Ottieni tutti gli ID dei blocchi a cui questo numero appartiene
+            block_ids_for_this_num = _get_block_ids_for_number(num, roulette_wheel_sequence, block_size=5)
+            
+            for block_id in block_ids_for_this_num:
+                # Calcola l'indice nel vettore complessivo delle features:
+                # (posizione del numero nella sequenza * numero totale di possibili ID di blocco) + ID del blocco
+                feature_index = (i * num_possible_outcomes) + block_id # num_possible_outcomes è 37
+                features[feature_index] = 1 # Imposta a 1 per indicare l'appartenenza
     
-    # Rimodella per la previsione di un singolo campione (1 riga, 185 colonne)
     return features.reshape(1, -1)
 
 
@@ -87,7 +118,7 @@ for name in model_names:
         models[name] = None
 
 
-# --- 3. NUOVA LOGICA: FUNZIONE PER TROVARE BLOCCHI CONTIGUI ---
+# --- 3. LOGICA PER TROVARE BLOCCHI CONTIGUI (rimane la stessa, ora applicata alle probabilità dei numeri) ---
 def find_contiguous_blocks(probabilities, num_blocks=3, block_size=5):
     """
     Trova i migliori blocchi di numeri contigui sulla ruota basandosi sulle probabilità.
@@ -100,15 +131,14 @@ def find_contiguous_blocks(probabilities, num_blocks=3, block_size=5):
 
     Returns:
         list of lists: Una lista contenente i blocchi trovati,
-                       dove ogni blocco è una lista di 5 numeri contigui.
+                       dove ogni blocco è una lista di `block_size` numeri contigui.
     """
     wheel_len = len(ROULETTE_WHEEL_SEQUENCE)
     block_scores = [] # Per memorizzare il punteggio di ogni possibile blocco
 
-    # Scansiona tutte le possibili posizioni di inizio blocco sulla ruota
     for start_index in range(wheel_len):
         current_block_numbers = []
-        current_block_score = 0
+        current_block_score = 0 # Inizializza il punteggio per ogni nuovo blocco
         
         for i in range(block_size):
             # Calcola l'indice circolare per la ruota
@@ -116,11 +146,8 @@ def find_contiguous_blocks(probabilities, num_blocks=3, block_size=5):
             number = ROULETTE_WHEEL_SEQUENCE[wheel_index]
             current_block_numbers.append(number)
             
-            # Somma le probabilità dei numeri nel blocco per ottenere un punteggio
-            # Assicurati che l'indice della probabilità esista (0-36)
             if 0 <= number <= 36:
                 current_block_score += probabilities[number]
-            # else: Gestire numeri fuori range se necessario, ma non dovrebbe accadere per roulette
 
         block_scores.append({
             'numbers': current_block_numbers,
@@ -134,8 +161,55 @@ def find_contiguous_blocks(probabilities, num_blocks=3, block_size=5):
 
     return top_blocks
 
+# --- 4. NUOVA LOGICA: PREVISIONE DI CONSENSO ---
+def _get_consensus_predictions(all_model_blocks, min_consensus_models=4, max_predictions=5): # MODIFICATO: min_consensus_models=4, max_predictions=5
+    """
+    Determina le previsioni di consenso basate sull'accordo tra più modelli.
+    
+    Args:
+        all_model_blocks (dict): Dizionario in cui le chiavi sono i nomi dei modelli e i valori
+                                 sono liste di blocchi previsti (es. {'model_A': [[n1,n2..], [n3,n4..]], ...}).
+        min_consensus_models (int): Numero minimo di modelli che devono prevedere un numero
+                                    affinché sia considerato nel consenso.
+        max_predictions (int): Numero massimo di numeri di consenso da restituire.
+                                Se più di `max_predictions` numeri hanno consenso, vengono prioritari per frequenza.
 
-# --- 4. FUNZIONE PRINCIPALE DELLA CLOUD FUNCTION ---
+    Returns:
+        list: Una lista di numeri unici che hanno raggiunto la soglia di consenso,
+              ordinati per frequenza tra i modelli, poi per numero.
+    """
+    number_model_votes = Counter() # Conta quanti MODELLI diversi hanno predetto ciascun numero
+    
+    # Itera sui blocchi previsti da ciascun modello
+    for model_name, predicted_blocks in all_model_blocks.items():
+        if isinstance(predicted_blocks, str): # Salta se il modello ha restituito una stringa di errore
+            continue
+        
+        # Raccogli tutti i numeri unici da QUESTI blocchi del modello corrente
+        model_unique_numbers_in_blocks = set()
+        for block in predicted_blocks:
+            model_unique_numbers_in_blocks.update(block)
+        
+        # Per ogni numero unico predetto da questo modello, aggiungi un "voto" al numero
+        for num in model_unique_numbers_in_blocks:
+            number_model_votes[num] += 1
+            
+    consensus_numbers = []
+    # Filtra i numeri che soddisfano la soglia minima di consenso
+    for num, votes in number_model_votes.items():
+        if votes >= min_consensus_models:
+            consensus_numbers.append((num, votes)) # Memorizza (numero, voti)
+            
+    # Ordina i numeri di consenso: prima per voti (decrescente), poi per numero (crescente)
+    consensus_numbers.sort(key=lambda x: (-x[1], x[0]))
+    
+    # Estrai solo i numeri e prendi i primi max_predictions
+    final_predictions = [num for num, votes in consensus_numbers[:max_predictions]]
+    
+    return final_predictions
+
+
+# --- 5. FUNZIONE PRINCIPALE DELLA CLOUD FUNCTION ---
 @functions_framework.http
 def predict_roulette(request):
     """
@@ -171,13 +245,22 @@ def predict_roulette(request):
         return ('Errore: "last_5_numbers" deve essere una lista di 5 numeri.', 400, headers)
 
     # Converti la lista di 5 numeri in un array NumPy con 185 caratteristiche (nuovo formato)
-    input_features = _prepare_features(last_5_numbers)
+    # Passa ROULETTE_WHEEL_SEQUENCE alla funzione di preparazione delle features
+    try:
+        input_features = _prepare_features(last_5_numbers, 
+                                           num_possible_outcomes=37, 
+                                           sequence_length=5, 
+                                           roulette_wheel_sequence=ROULETTE_WHEEL_SEQUENCE)
+    except ValueError as e:
+        logging.error(f"Errore durante la preparazione delle features: {e}")
+        return (f"Errore durante la preparazione delle features: {e}", 400, headers)
 
-    all_predictions = {}
+
+    all_model_predictions_blocks = {} # Memorizza le previsioni dei blocchi da ciascun modello
 
     for model_name, model in models.items():
         if model is None:
-            all_predictions[model_name] = "Modello non disponibile"
+            all_model_predictions_blocks[model_name] = "Modello non disponibile"
             logging.warning(f"Modello {model_name} non disponibile, saltato.")
             continue
 
@@ -185,16 +268,31 @@ def predict_roulette(request):
             # Prevedi le probabilità di tutti i 37 numeri
             probabilities = model.predict_proba(input_features)[0] # Ottieni le probabilità per la singola previsione
 
-            # --- NUOVA LOGICA: Trova i blocchi contigui ---
+            # Trova i migliori blocchi contigui basati su queste probabilità
             top_contiguous_blocks = find_contiguous_blocks(probabilities, num_blocks=3, block_size=5)
             
-            # L'output ora sarà una lista di blocchi
-            all_predictions[model_name] = top_contiguous_blocks
+            # Memorizza i blocchi previsti per questo modello
+            all_model_predictions_blocks[model_name] = top_contiguous_blocks
             logging.info(f"Previsione {model_name} (blocchi contigui): {top_contiguous_blocks}")
 
         except Exception as e:
-            all_predictions[model_name] = f"Errore durante la previsione: {e}"
+            all_model_predictions_blocks[model_name] = f"Errore durante la previsione: {e}"
             logging.error(f"Errore durante la previsione con {model_name}: {e}")
             logging.error(traceback.format_exc())
 
-    return (all_predictions, 200, headers)
+    # --- Applica la Logica di Consenso ---
+    consensus_final_numbers = _get_consensus_predictions(all_model_predictions_blocks, 
+                                                         min_consensus_models=4, # MODIFICATO: min_consensus_models=4
+                                                         max_predictions=PRED_NUMERI) 
+
+    # La Cloud Function ora restituirà un dizionario con le previsioni dei singoli modelli
+    # E un nuovo campo per le previsioni di consenso.
+    response_data = {
+        'logistic_regression': all_model_predictions_blocks.get('logistic_regression', "Modello non disponibile"),
+        'random_forest': all_model_predictions_blocks.get('random_forest', "Modello non disponibile"),
+        'lightgbm': all_model_predictions_blocks.get('lightgbm', "Modello non disponibile"),
+        'catboost': all_model_predictions_blocks.get('catboost', "Modello non disponibile"),
+        'consensus_predictions': consensus_final_numbers # Nuovo campo per il consenso
+    }
+
+    return (response_data, 200, headers)
